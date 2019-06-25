@@ -1,0 +1,491 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## 1.Package
+```{r}
+library(e1071)
+library(MASS)
+library(rpart)
+library(tree)
+library(randomForest)
+library(gbm)
+library(fastAdaboost)
+library(xgboost)
+library(ROCR)
+library(stringdist)
+suppressMessages(library("tidyverse"))
+library(tidyverse)  
+library(caret)
+```
+## 2. Loading the Dataset
+```{r}
+location <- read_csv("/Users/effyhou/Desktop/6240mining/hw4/Location.csv")
+category <- read_csv("/Users/effyhou/Desktop/6240mining/hw4/Category.csv")
+train <- read_csv("/Users/effyhou/Desktop/6240mining/hw4/ItemPairs_train.csv")
+train_info <- read_csv("/Users/effyhou/Desktop/6240mining/hw4/ItemInfo_train.csv")
+```
+
+##  3. Data pre-processing
+```{r}
+#First, combine location and regionIDs
+train_info <- train_info %>% left_join(location)
+ 
+
+#Second, combine test and train tables with the data in info files
+
+#Some functions to help with the renaming later on
+old_cols <- colnames(train)
+is_old_column <- function(x){names(x) %in% old_cols}
+check_id <- function(x,id="1"){str_sub(names(x),start = -1)==id}
+name_adder <- function(x,to_add="1"){paste0(x,to_add)}
+
+#One line dplyr call to combine tables and rename things
+train <- train %>% 
+  left_join(train_info,by=c("itemID_1" = "itemID")) %>% 
+  rename_if(!is_old_column(.),name_adder,to_add="1") %>%  
+  left_join(train_info,by=c("itemID_2" = "itemID")) %>% 
+  rename_if(!is_old_column(.) & !check_id(.,id="1"),name_adder,to_add="2")
+
+ 
+
+```
+
+## 4. creates features
+```{r}
+# This function creates features
+matchPair <- function(x, y){
+  ifelse(is.na(x), ifelse(is.na(y), 3, 2), ifelse(is.na(y), 2, ifelse(x==y, 1, 4)))
+}
+
+feature_creator1 <- function(x){
+  x %>% 
+    mutate(#distance
+      distance = sqrt((lat1-lat2)^2+(lon1-lon2)^2),
+      #same location
+      sameLoc=matchPair(locationID1 ,locationID2),
+      #same metroID
+      samemetro = matchPair(metroID1,metroID2),
+      #price
+      sameprice=matchPair(price1,price2),
+      priceDiff = pmax(price1/price2, price2/price1),
+      priceMin = pmin(price1, price2, na.rm=TRUE),
+      priceMax = pmax(price1, price2, na.rm=TRUE),
+      #title
+      titleStringDist = stringdist(title1, title2, method = "jw"),
+      titleStringDist2 = (stringdist(title1, title2, 
+                                     method = "lcs")/pmax(nchar(title1), nchar(title2),
+                                                          na.rm=TRUE)),
+      titleCharDiff=pmax(nchar(title1)/nchar(title2),
+                         nchar(title2)/nchar(title1)),
+      titleCharMin = pmin(nchar(title1), nchar(title2), na.rm=TRUE),
+      titleCharMax = pmax(nchar(title1), nchar(title2), na.rm=TRUE),
+      titleMatch=matchPair(title1,title2),
+      descriptionMatch=matchPair(description1,description2),
+      descriptionCharDiff = pmax(nchar(description1)/nchar(description2), 
+                                 nchar(description2)/ nchar(description1)),
+     descriptionCharMin = pmin( nchar(description1),  nchar(description2), na.rm=TRUE),
+     descriptionCharMax = pmax( nchar(description1),  nchar(description2), na.rm=TRUE)
+       
+    )
+}
+
+  
+feature_creator5 <- function(x){
+  x %>% 
+    mutate(#distance
+      distance = sqrt((lat1-lat2)^2+(lon1-lon2)^2),
+      #same location
+      sameLoc=matchPair(locationID1 ,locationID2),
+      #same metroID
+      samemetro = matchPair(metroID1,metroID2),
+      #price
+      sameprice=matchPair(price1,price2),
+      priceDiff = pmax(price1/price2, price2/price1),
+      priceMin = pmin(price1, price2, na.rm=TRUE),
+      priceMax = pmax(price1, price2, na.rm=TRUE),
+      #title
+      titleStringDist = stringdist(title1, title2, method = "jw"),
+      titleStringDist2 = (stringdist(title1, title2, 
+                                     method = "lcs")/pmax(nchar(title1), nchar(title2),
+                                                          na.rm=TRUE)),
+      titleCharDiff=pmax(nchar(title1)/nchar(title2),
+                         nchar(title2)/nchar(title1)),
+      titleCharMin = pmin(nchar(title1), nchar(title2), na.rm=TRUE),
+      titleCharMax = pmax(nchar(title1), nchar(title2), na.rm=TRUE),
+      titleMatch=matchPair(title1,title2),
+      descriptionMatch=matchPair(description1,description2),
+      descriptionCharDiff = pmax(nchar(description1)/nchar(description2), 
+                                 nchar(description2)/ nchar(description1)),
+     descriptionCharMin = pmin( nchar(description1),  nchar(description2), na.rm=TRUE),
+     descriptionCharMax = pmax( nchar(description1),  nchar(description2), na.rm=TRUE),
+     
+     # title-discrition distance
+      title_discription_Dist_jw_1_1 = stringdist(title1, description1, method = "jw"),
+      title_discription_Dist_jw_2_2 = stringdist(title2, description2, method = "jw"),
+      title_discription_Dist_ja_1_1 = stringdist(title1, description1, method = "jaccard"),
+      title_discription_Dist_ja_2_2 = stringdist(title2, description2, method = "jaccard"),
+      title_discription_Dist_co_1_1 = stringdist(title1, description1, method = "cosine"),
+      title_discription_Dist_co_2_2 = stringdist(title2, description2, method = "cosine")
+       
+    )
+}
+
+train1<- train%>% feature_creator1
+train5<- train%>% feature_creator5
+
+train1[is.na(train1)] <- -9999
+train1[train1==Inf] <- -9999
+train5[is.na(train5)] <- -9999
+train5[train5==Inf] <- -9999
+
+```
+## 5. Randomly subsample and split  
+
+### sample train  with feature1
+```{r}
+set.seed(123)
+subtrain1 <- sample_frac(train1,0.03)
+
+subtrain1 <- subtrain1  %>% mutate(isDuplicate=factor(isDuplicate))
+subtrain1 <- subtrain1 %>% select(isDuplicate,distance:descriptionCharMax)
+
+#Split the data into train, test and validation
+spec1<- c(sample_train1 = 1/3, sample_test1  = 1/3, sample_valid1 = 1/3)
+
+split1 <- sample(cut(
+  seq(nrow(subtrain1)),
+  nrow(subtrain1)*cumsum(c(0,spec1)),
+  labels = names(spec1)
+))
+
+res1 <- split(subtrain1, split1)
+
+sample_train1 <- res1$sample_train1
+sample_test1 <-  res1$sample_test1 
+sample_valid1  <- res1$sample_valid1
+
+
+
+```
+
+ 
+### sample train  with feature5
+```{r}
+set.seed(123)
+subtrain5 <- sample_frac(train5,0.03)
+
+subtrain5 <- subtrain5  %>% mutate(isDuplicate=factor(isDuplicate))
+subtrain5 <- subtrain5 %>% select(isDuplicate,distance:descriptionCharMax)
+
+#Split the data into train, test and validation
+spec5<- c(sample_train5 = 1/3, sample_test5  = 1/3, sample_valid5= 1/3)
+
+split5 <- sample(cut(
+  seq(nrow(subtrain5)),
+  nrow(subtrain5)*cumsum(c(0,spec5)),
+  labels = names(spec5)
+))
+
+res5 <- split(subtrain5, split5)
+
+sample_train5 <- res5$sample_train5
+sample_test5 <-  res5$sample_test5
+sample_valid5  <- res5$sample_valid5
+
+```
+
+## 6. Fit 10 different models on the training data
+Based on HW4 I choose top 5 models : XGboost,  RandomForest,logistic, LDA, gbm
+ 
+### 6.1 h2o randomForest
+ 
+```{r}
+#h2o.shutdown()
+library(h2o)
+h2o.init(nthreads=-1,max_mem_size='4G')
+sample_trainHex1<-as.h2o(sample_train1)
+features1<-colnames(sample_train1)[!(colnames(sample_train1) %in% c("isDuplicate"))]
+validationHex1<-as.h2o(sample_valid1)
+testHex1<-as.h2o(sample_test1)
+rf1 <- h2o.randomForest(x=features1, 
+                             y="isDuplicate",
+                             training_frame = sample_trainHex1,
+                             validation_frame = validationHex1,
+                             ntree=500,
+                             seed = 123)
+#predict validation
+ rf1_pred_valid<-predict(rf1  ,validationHex1, probability=TRUE)[3]
+ rf1_pred_valid<-as.vector(rf1_pred_valid)
+#predict test
+ rf1_pred_test<-predict(rf1  ,testHex1, probability=TRUE)[3]
+ rf1_pred_test<-as.vector(rf1_pred_test)
+ 
+ 
+sample_trainHex5<-as.h2o(sample_train5)
+features5<-colnames(sample_train5)[!(colnames(sample_train5) %in% c("isDuplicate"))]
+validationHex5<-as.h2o(sample_valid5)
+testHex5<-as.h2o(sample_test5)
+rf5<- h2o.randomForest(x=features5, 
+                             y="isDuplicate",
+                             training_frame = sample_trainHex5,
+                             validation_frame = validationHex5,
+                             ntree=500,
+                             seed = 123)
+#predict validation
+ rf5_pred_valid<-predict(rf5  ,validationHex5, probability=TRUE)[3]
+ rf5_pred_valid<-as.vector(rf5_pred_valid)
+#predict test
+ rf5_pred_test<-predict( rf5  ,testHex5, probability=TRUE)[3]
+ rf5_pred_test<-as.vector(rf5_pred_test)
+ 
+```
+ 
+### 6.2 xgboost 
+ 
+```{r}
+maxTrees <- 200
+shrinkage <- 0.10
+gamma <- 1
+depth <- 10
+minChildWeight <- 40
+colSample <- 0.85
+subSample <- 0.85
+earlyStopRound <- 4
+
+xg1_features<-colnames(sample_train1)[!(colnames(sample_train1) %in% c("isDuplicate"))]
+d_train1 <- xgb.DMatrix(as.matrix(sample_train1[, xg1_features]), label=as.numeric(sample_train1$isDuplicate)-1)
+d_validation1 <- sample_valid1%>% 
+  select(-isDuplicate) %>% 
+  as.matrix %>% 
+  xgb.DMatrix(label=as.numeric(sample_valid1$isDuplicate)-1)
+ 
+test_p1<-sample_test1[,-1]
+d_test1 <- xgb.DMatrix(as.matrix(test_p1))
+
+
+xgb1 <- xgboost(params=list(max_depth=depth,
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_bytree=colSample,
+                                 min_child_weight=minChildWeight),
+                     data=d_train1,
+                     nrounds=90,
+                     objective="binary:logistic",
+                     eval_metric="auc")   #0.855005 
+
+#predict validation: 
+ xgb1_pred_valid <- predict( xgb1, d_validation1)  
+
+#predict test:
+xgb1_pred_test <- predict( xgb1, d_test1)
+
+
+xg5_features<-colnames(sample_train5)[!(colnames(sample_train5) %in% c("isDuplicate"))]
+d_train5 <- xgb.DMatrix(as.matrix(sample_train5[, xg5_features]), label=as.numeric(sample_train5$isDuplicate)-1)
+d_validation5 <- sample_valid5%>% 
+  select(-isDuplicate) %>% 
+  as.matrix %>% 
+  xgb.DMatrix(label=as.numeric(sample_valid5$isDuplicate)-1)
+ 
+test_p5<-sample_test5[,-1]
+d_test5 <- xgb.DMatrix(as.matrix(test_p5))
+
+
+xgb5 <- xgboost(params=list(max_depth=depth,
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_bytree=colSample,
+                                 min_child_weight=minChildWeight),
+                     data=d_train5,
+                     nrounds=100,
+                     objective="binary:logistic",
+                     eval_metric="auc")   #0.857057 
+
+#predict validation: 
+ xgb5_pred_valid <- predict( xgb5, d_validation5)  
+
+#predict test:
+xgb5_pred_test <- predict( xgb5, d_test5)
+
+
+xgb5_prediction<- prediction(xgb5_pred_test,labels=sample_test1$isDuplicate)
+
+performance(xgb5_prediction,"auc")@y.values[[1]]  #  0.8178197
+
+ 
+ 
+``` 
+ 
+ 
+ 
+ 
+### 6.3  LDA
+```{r}
+#LDA:
+
+lda1<- lda(isDuplicate~.,data = sample_train1)
+lda1  
+
+#predict validation
+lda1_pred_valid<- lda1 %>% 
+  predict(sample_valid1) %>% 
+  (function(x) x$posterior[,2]) 
+lda1_pred_valid <-as.vector(lda1_pred_valid)
+
+#predict test
+lda1_pred_test <- lda1 %>% 
+  predict(sample_test1) %>% 
+  (function(x) x$posterior[,2]) 
+lda1_pred_test<-as.vector(lda1_pred_test)
+
+ ####Feature 5
+lda5<- lda(isDuplicate~.,data = sample_train5)
+lda5  
+
+#predict validation
+lda5_pred_valid<- lda5 %>% 
+  predict(sample_valid5) %>% 
+  (function(x) x$posterior[,2]) 
+lda5_pred_valid <-as.vector(lda5_pred_valid)
+
+#predict test
+lda5_pred_test <- lda5 %>% 
+  predict(sample_test5) %>% 
+  (function(x) x$posterior[,2]) 
+lda5_pred_test<-as.vector(lda5_pred_test)
+```
+### 6.4  GBM
+```{r}
+ 
+sample_trainHex1<-as.h2o(sample_train1)
+validationHex1<-as.h2o(sample_valid1)
+testHex1<-as.h2o(sample_test1)
+gbm1 <- h2o.gbm(
+  ## standard model parameters
+  x = features1,
+  y="isDuplicate",
+  training_frame = sample_trainHex1,
+  validation_frame = validationHex1,
+  ntrees = 500,
+  learn_rate=0.07,
+  sample_rate = 0.8,
+  col_sample_rate = 0.6,
+  seed = 1234,
+  max_depth=7
+)
+
+#predict validation
+gbm_pred_valid1<-predict(gbm1 ,validationHex1, probability=TRUE)[3]
+gbm_pred_valid1<-as.vector(gbm_pred_valid1)
+#predict test
+gbm_pred_test1<-predict(gbm1,testHex1, probability=TRUE)[3]
+gbm_pred_test1<-as.vector(gbm_pred_test1)
+
+ 
+
+sample_trainHex5<-as.h2o(sample_train5)
+validationHex5<-as.h2o(sample_valid5)
+testHex5<-as.h2o(sample_test5)
+gbm5 <- h2o.gbm(
+  ## standard model parameters
+  x = features5,
+  y="isDuplicate",
+  training_frame = sample_trainHex5,
+  validation_frame = validationHex5,
+  ntrees = 500,
+  learn_rate=0.07,
+  sample_rate = 0.8,
+  col_sample_rate = 0.6,
+  seed = 1234,
+  max_depth=7
+)
+
+#predict validation
+gbm_pred_valid5<-predict(gbm5 ,validationHex5, probability=TRUE)[3]
+gbm_pred_valid5<-as.vector(gbm_pred_valid5)
+#predict test
+gbm_pred_test5<-predict(gbm5,testHex5, probability=TRUE)[3]
+gbm_pred_test5<-as.vector(gbm_pred_test5)
+
+```
+### 6.5 Logistic regression 
+```{r}
+lg1 <- glm(isDuplicate ~ .,data=sample_train1,family="binomial")
+lg1_pred_valid <- lg1 %>% 
+  predict(sample_valid1,type="response") 
+lg1_pred_valid<-as.vector(lg1_pred_valid) 
+
+lg1_pred_test <- lg1 %>% 
+  predict(sample_test1,type="response") 
+lg1_pred_test<-as.vector(lg1_pred_test) 
+ 
+lg5 <- glm(isDuplicate ~ .,data=sample_train5,family="binomial") 
+lg5_pred_valid <- lg5 %>% 
+  predict(sample_valid5,type="response") 
+lg5_pred_valid<-as.vector(lg5_pred_valid) 
+
+
+lg5_pred_test <- lg5 %>% 
+  predict(sample_test5,type="response") 
+lg5_pred_test<-as.vector(lg5_pred_test) 
+```
+
+
+
+ 
+## 7. Stacking
+###7.1 stacking model (stacking 10 different models)
+
+Use 10 Models:2 logistic regression, 2 xgboost, 2 gbm, 2 LDA, 2 RandomForest;
+
+Use feature 1 and feature 5
+```{r}
+stack_v<-cbind(lda1_pred_valid,lda5_pred_valid,
+                gbm_pred_valid1,gbm_pred_valid5,
+                lg1_pred_valid,lg5_pred_valid,
+                xgb1_pred_valid,xgb5_pred_valid,
+                rf1_pred_valid,rf5_pred_valid)
+
+stack_t<-cbind(lda1_pred_test,lda5_pred_test,
+                gbm_pred_test1,gbm_pred_test5,
+                lg1_pred_test,lg5_pred_test,
+                xgb1_pred_test,xgb5_pred_test,
+                rf1_pred_test,rf5_pred_test)
+
+ 
+
+stack_v_xg<- xgb.DMatrix(as.matrix(stack_v), label=as.numeric(sample_valid1$isDuplicate)-1) 
+ 
+modelStack<- xgboost(params=list(max_depth=depth,
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_bytree=colSample,
+                                 min_child_weight=minChildWeight),
+                     data=stack_v_xg,
+                     nrounds=100,
+                     objective="binary:logistic",
+                     eval_metric="auc")   #0.843325 
+
+modelStack_predict<- predict(modelStack,stack_t)
+ 
+
+#AUC
+stack_prediction<- prediction(modelStack_predict,labels=sample_test1$isDuplicate)
+
+performance(stack_prediction,"auc")@y.values[[1]]  # 0.819282
+```
+Stacking model has higher AUC (0.819282) than the single XGboost model (which has the highest AUC score (0.8178197) among 10 different models).
+
+### 7.2 Use Stacking model to obtain classifications
+ 
+```{r}
+
+class_stack<-ifelse (modelStack_predict > 0.5,1,0)
+ 
+```
+ 
+ 
+ 
