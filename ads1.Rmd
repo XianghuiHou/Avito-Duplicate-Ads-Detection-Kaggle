@@ -1,0 +1,455 @@
+ ---
+Title: "HW4"
+Author: "Xianghui Hou"
+Date: "3/17/2019"
+output: pdf_document
+---
+
+## 1. Packages
+
+```{r}
+library(e1071)
+library(MASS)
+library(rpart)
+library(tree)
+library(randomForest)
+library(gbm)
+library(fastAdaboost)
+library(xgboost)
+library(ROCR)
+library(stringdist)
+suppressMessages(library("tidyverse"))
+library(tidyverse)  
+library(caret)
+```
+
+## 2. Loading the Dataset
+
+```{r, message=FALSE, warning=FALSE}
+location <- read_csv("/Users/effyhou/Desktop/GWU/6240mining/hw4/Location.csv")
+category <- read_csv("/Users/effyhou/Desktop/GWU/6240mining/hw4/Category.csv")
+test <- read_csv("/Users/effyhou/Desktop/GWU/6240mining/hw4/ItemPairs_test.csv")
+train <- read_csv("/Users/effyhou/Desktop/GWU/6240mining/hw4/ItemPairs_train.csv")
+test_info<- read_csv("/Users/effyhou/Desktop/GWU/6240mining/hw4/ItemInfo_test.csv")
+train_info <- read_csv("/Users/effyhou/Desktop/GWU/6240mining/hw4/ItemInfo_train.csv")
+
+test_back<-test
+test_info_back<-test_info
+train_back<-train
+train_info_back<-train_info
+```
+ 
+## 3.Data exploration
+```{r}
+# the peak in y axies is about 0.225. 
+# About 22.5 % of values are around price exp(7).
+# Most of prices are in the range of exp(6)~exp(11).
+train_info_back %>% 
+  mutate(logprice=log(price)) %>% 
+  ggplot + geom_density(aes(x=logprice))
+# most latitudes are in the range of: 40-70, 
+# most longtitudes are in the range of: 45-150
+ train_info_back %>% 
+   select(lat,lon) %>% 
+   ggplot(aes(x=lat,y=lon))+geom_point()  
+
+ 
+ train_info_join<-  train_info_back %>% 
+  left_join(location) #add region id according to locationid
+
+ test_info_join <-test_info_back %>% 
+  left_join(location) #add region id according to locationid
+
+ # the most region's median longtitude is 46 and median lattitude is 55.
+ train_info_join %>% group_by(regionID) %>% 
+  summarise(mean_lat=mean(lat),
+            mean_lon=mean(lon),
+            size = n()
+  ) %>% 
+  ggplot(aes(y=mean_lat,x=mean_lon,size=size))+
+  geom_point()  
+```
+
+## 4. Data pre-processing
+
+```{r}
+#First, combine location and regionIDs
+train_info <- train_info %>% left_join(location)
+test_info <- test_info %>% left_join(location)
+
+#Second, combine test and train tables with the data in info files
+
+#Some functions to help with the renaming later on
+old_cols <- colnames(train)
+is_old_column <- function(x){names(x) %in% old_cols}
+check_id <- function(x,id="1"){str_sub(names(x),start = -1)==id}
+name_adder <- function(x,to_add="1"){paste0(x,to_add)}
+
+#One line dplyr call to combine tables and rename things
+train <- train %>% 
+  left_join(train_info,by=c("itemID_1" = "itemID")) %>% # join where itemID = itemID_1
+  rename_if(!is_old_column(.),name_adder,to_add="1") %>%  # add 1 to itemId -> itemId_1
+  left_join(train_info,by=c("itemID_2" = "itemID")) %>% # join where itemID = itemID_2
+  rename_if(!is_old_column(.) & !check_id(.,id="1"),name_adder,to_add="2")  # 把剩下的没有下标1 并且等于item_2的 全部下标2
+
+test <- test %>% 
+  left_join(test_info,by=c("itemID_1" = "itemID")) %>% 
+  rename_if(!is_old_column(.),name_adder,to_add="1") %>% 
+  left_join(test_info,by=c("itemID_2" = "itemID")) %>% 
+  rename_if(!is_old_column(.) & !check_id(.,id="1"),name_adder,to_add="2")
+
+
+```
+### 4.1 creates features
+```{r}
+# This function creates features
+matchPair <- function(x, y){
+  ifelse(is.na(x), ifelse(is.na(y), 3, 2), ifelse(is.na(y), 2, ifelse(x==y, 1, 4)))
+}
+
+feature_creator <- function(x){
+  x %>% 
+    mutate(#distance
+      distance = sqrt((lat1-lat2)^2+(lon1-lon2)^2),
+      #same location
+      sameLoc=matchPair(locationID1 ,locationID2),
+      #same metroID
+      samemetro = matchPair(metroID1,metroID2),
+      #price
+      sameprice=matchPair(price1,price2),
+      priceDiff = pmax(price1/price2, price2/price1),
+      priceMin = pmin(price1, price2, na.rm=TRUE),
+      priceMax = pmax(price1, price2, na.rm=TRUE),
+      #title
+      titleStringDist = stringdist(title1, title2, method = "jw"),
+      titleStringDist2 = (stringdist(title1, title2, 
+                                     method = "lcs")/pmax(nchar(title1), nchar(title2),
+                                                          na.rm=TRUE)),
+      titleCharDiff=pmax(nchar(title1)/nchar(title2),
+                         nchar(title2)/nchar(title1)),
+      titleCharMin = pmin(nchar(title1), nchar(title2), na.rm=TRUE),
+      titleCharMax = pmax(nchar(title1), nchar(title2), na.rm=TRUE),
+      titleMatch=matchPair(title1,title2),
+      descriptionMatch=matchPair(description1,description2),
+      descriptionCharDiff = pmax(nchar(description1)/nchar(description2), 
+                                 nchar(description2)/ nchar(description1)),
+     descriptionCharMin = pmin( nchar(description1),  nchar(description2), na.rm=TRUE),
+     descriptionCharMax = pmax( nchar(description1),  nchar(description2), na.rm=TRUE)
+       
+    )
+}
+train<- train%>% feature_creator
+test <- test%>% feature_creator
+
+train[is.na(train)] <- -9999
+test[is.na(test)] <- -9999
+
+train[train==Inf] <- -9999
+test[test==Inf] <- -9999
+
+```
+  
+### 4.2 choose variables
+```{r}
+train <- train %>% mutate(isDuplicate=factor(isDuplicate))
+
+train <- train %>% select(isDuplicate,distance:descriptionCharMax)
+test <- test %>% select(id1,distance:descriptionCharMax)
+```
+### 4.3 validation set
+```{r}
+#validation   : 10% of train data for validation
+validation_id <- sample(nrow(train),
+                        size = floor(nrow(train)*.10),
+                        replace = FALSE)
+
+validation <- train[validation_id,]
+train <- train[-validation_id,]
+```
+
+## 5. Models
+
+### 5.1.Logistic Regression
+```{r}
+model1 <- glm(isDuplicate ~ .,data=train,family="binomial")
+model1 %>% summary
+
+#predict validation
+model1_pred <- model1 %>% 
+  predict(validation,type="response") %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model1_pred,"auc")@y.values[[1]] #0.7627547
+
+
+#Logistic Regression:
+#  (1) the AUC of validation sample is 0.7627547
+#  (2) the AUC of test dataset is 0.73996
+#  (3)Predictors are significant except priceDiff,priceMin,priceMax,titleCharMin and descriptionCharDiff.
+
+```
+
+### 5.2.LDA
+```{r}
+library(MASS)
+model2 <- lda(isDuplicate~.,data = train)
+model2
+
+#predict validation
+model2_pred <- model2 %>% 
+  predict(validation) %>% 
+  (function(x) x$posterior[,2]) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model2_pred,"auc")@y.values[[1]] # 0.7623062
+par(mfrow=c(1,1))
+
+
+# LDA:
+#  (1) the AUC of validation sample is 0.7185702
+#  (2) the AUC of test dataset is  0.74045
+```
+
+
+### 5.3.QDA
+
+```{r}
+model3 <- qda(isDuplicate~.,data = train)
+model3
+#predict validation
+model3_pred <- model3 %>% 
+  predict(validation) %>% 
+  (function(x) x$posterior[,2]) %>% 
+  prediction(labels=validation$isDuplicate)
+performance(model3_pred,"auc")@y.values[[1]] #0.7042764
+ 
+# QDA:
+#  (1) the AUC of validation sample is 0.7042764
+#  (2) the AUC of test dataset is  0.69562
+
+ 
+```
+
+
+### 5.4 SVM
+
+#### 5.5.1 SVM - Linear Kernel
+```{r}
+library(e1071)
+sample_train <- sample_frac(train,0.01) #we subsample due to memory limits
+
+model4a <- svm(isDuplicate~.,data=sample_train,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="linear",probability=TRUE)
+
+#validation predict
+svm4a_pred<-predict(model4a ,validation, probability=TRUE) 
+model4a_pred <- prediction(attr(svm4a_pred,"probabilities")[,2],labels=validation$isDuplicate)
+performance(model4a_pred,"auc")@y.values[[1]] #0.7611456
+
+# SVM - Linear Kernel:
+#  (1) the AUC of validation sample is 0.7611456
+#  (2) the AUC of test dataset is  0.74008
+```
+
+#### 5.5.2 SVM - Polynomial Kernel
+```{r}
+ 
+model4b <- svm(isDuplicate~.,data=sample_train,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="polynomial",probability=TRUE)
+
+svm4b_pred<-predict(model4b ,validation, probability=TRUE) 
+model4b_pred <- prediction(attr(svm4b_pred,"probabilities")[,2],labels=validation$isDuplicate)
+performance(model4b_pred,"auc")@y.values[[1]] # 0.7604506
+
+
+# SVM - Polynomial Kernel:
+#  (1) the AUC of validation sample is 0.7604506
+#  (2) the AUC of test dataset is  0.73106
+```
+
+#### 5.5.3 SVM - Radial Kernel
+```{r}
+ 
+model4c <- svm(isDuplicate~.,data=sample_train,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="radial",probability=TRUE)
+
+svm4c_pred<-predict(model4c ,validation, probability=TRUE) 
+model4c_pred <- prediction(attr(svm4c_pred,"probabilities")[,2],labels=validation$isDuplicate)
+performance(model4c_pred,"auc")@y.values[[1]] #0.7680936
+
+# SVM - Radial Kernel:
+#  (1) the AUC of validation sample is 0.7680936
+#  (2) the AUC of test dataset is  0.73533
+```
+
+### 5.5 Randomforest
+
+####  h2o package offers parallelized computing
+```{r}
+ 
+sample_train <- sample_frac(train,0.01)
+#h2o.shutdown()
+library(h2o)
+h2o.init(nthreads=-1,max_mem_size='4G')
+sample_trainHex<-as.h2o(sample_train)
+features<-colnames(train)[!(colnames(train) %in% c("isDuplicate"))]
+validationHex<-as.h2o(validation)
+model_rf2 <- h2o.randomForest(x=features, 
+                             y="isDuplicate",
+                             training_frame = sample_trainHex,
+                             validation_frame = validationHex,
+                             ntree=500,
+                            seed = 123
+                             ) #AUC:  0.8015247
+
+ 
+# Random Forest:
+#  (1) the random forest  model  on validation set
+#     has auc: 0.8015247
+#  (2) after choosing the model, fitting the model in the test data,
+#      the AUC  is #0.75395 for test dataset.
+
+```
+### 5.6 Gradient Boosting Machine
+
+#### Tuning the parameters
+
+grid search on h2o.gradient boost
+```{r}
+# GBM hyperparamters
+gbm_params2 <- list(learn_rate = seq(0.01, 0.1, 0.01),
+                    max_depth = seq(1, 10),
+                    sample_rate = seq(0.5, 1.0, 0.1),
+                    col_sample_rate = seq(0.1, 1.0, 0.1))
+search_criteria2 <- list(strategy = "RandomDiscrete", 
+                         max_models = 20,max_runtime_secs=60)
+
+# Train and validate a grid of GBMs
+  gbm_grid2 <- h2o.grid("gbm", x=features, 
+                        y="isDuplicate",
+                      distribution="bernoulli",
+                      grid_id = "gbm_grid2",
+                      training_frame = sample_trainHex,
+                      validation_frame=validationHex,
+                      ntrees = 500,  
+                      seed = 1,
+                      hyper_params = gbm_params2,
+                      search_criteria = search_criteria2)
+
+gbm_gridperf2 <- h2o.getGrid(grid_id = "gbm_grid2", 
+                             sort_by = "auc", 
+                             decreasing = TRUE)
+print(gbm_gridperf2)
+
+#best model:
+#parameter:{#max_depth :9, mtries: 1 ntrees :500, AUC:0.8189238}
+best_gbm_id <- gbm_gridperf2@model_ids[[1]]
+best_model_gbm <- h2o.getModel(best_gbm_id) #AUC:  0.8189238
+print(best_model_gbm)
+ 
+  
+# Gradient  boosted :
+#  (1) the best model chosen from random forest has auc: 0.8189238
+#  (2) after choosing the best model, fitting the model in the test data,
+#      the AUC is 0.76289 for test datset.
+
+```
+### 5.7 Xgboost  
+
+```{r}
+maxTrees <- 200
+shrinkage <- 0.10
+gamma <- 1
+depth <- 10
+minChildWeight <- 40
+colSample <- 0.85
+subSample <- 0.85
+earlyStopRound <- 4
+
+ 
+d_train <- xgb.DMatrix(as.matrix(train[, features]), label=as.numeric(train$isDuplicate)-1)
+d_validation <- validation %>% 
+  select(-isDuplicate) %>% 
+  as.matrix %>% 
+  xgb.DMatrix(label=as.numeric(validation$isDuplicate)-1)
+ 
+test_p<-test[,-1]
+d_test <- xgb.DMatrix(as.matrix(test_p))
+
+
+model_xgb <- xgboost(params=list(max_depth=depth,
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_bytree=colSample,
+                                 min_child_weight=minChildWeight),
+                     data=d_train,
+                     nrounds=90,
+                     objective="binary:logistic",
+                     eval_metric="auc")   #0.841963 
+
+#validation: 
+model_xgb_pred <- predict(model_xgb, d_validation) %>% 
+prediction(labels=validation$isDuplicate)
+performance(model_xgb_pred,"auc")@y.values[[1]] # 0.8378732
+
+#test:
+model_xgb_pred_test <- predict(model_xgb, d_test)
+submission9 <- data.frame(id=test$id1, probability=model_xgb_pred_test )
+write.csv(submission9, file="XGboost.csv",row.names=FALSE)   #0.78936 
+
+ 
+# Xgboost :
+#  (1) the best model chosen from Xgboost has auc: 0.841963 
+#  (2) after choosing the best model, fitting the model in the validation data,
+#      the AUC is 0.8378732 for validation dataset.
+#      Since 0.8378732 is the highest AUC among all models, I choose XGboost
+#      as the final classifier and predict with test data
+#  (3) after choosing the best model, fitting the model in the test data,
+#      the AUC is 0.78936 for test dataset.
+```
+
+### 5.8 Adaboost
+ 
+```{r}
+sample_train2<-sample_train
+sample_train2<-as.data.frame(sample_train2)
+model_adaboost <- adaboost(isDuplicate~., sample_train2, 500,method = Adaboost.M1)
+#validation
+model_adaboost_pred <- model_adaboost %>% predict(validation)
+model_adaboost_prediction<- prediction(model_adaboost_pred$prob[,2],labels=validation$isDuplicate)
+performance(model_adaboost_prediction,"auc")@y.values[[1]]  #0.8060377
+
+# FastAdaboost:
+#  (1) the AUC of validation sample is 0.8060377
+#  (2) the AUC of test dataset is  0.75847
+```
+## Summary
+
+```{text}
+In this project, I fitted and evaluated several Classification methods: 
+LDA, QDA, Logistic regression, SVM(linear, Polynomial, Radial),
+Decision Trees, Random Forests, Adaboost, Xgboost and Gradient Boost. 
+For Decision Trees, Random Forests and Gradient Boost, I used h2o package
+which offer parallized computing. Grid search in h2o package helps to tune
+the parameters in models.
+The highest AUC score is from Xgboost which is 0.78936 on the test dataset.
+
+```
+
+###XGboost AUC on leaderboard
+```{r out.width = "90%"}
+library(png)
+library(knitr)
+include_graphics("/Users/effyhou/Desktop/6240mining/hw4/XGboost.png")
+ 
+```
+
+
+
+ 
+ 
+ 
+
+ 
+
+ 
